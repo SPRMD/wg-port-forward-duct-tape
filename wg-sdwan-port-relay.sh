@@ -166,6 +166,32 @@ ensure_key() {
   fi
 }
 
+ensure_psk() {
+  ensure_dirs
+  if [ ! -s "${KEY_DIR}/presharedkey" ]; then
+    wg genpsk > "${KEY_DIR}/presharedkey"
+    chmod 600 "${KEY_DIR}/presharedkey"
+  fi
+}
+
+default_psk() {
+  if [ -n "${WG_PSK:-}" ]; then
+    printf '%s
+' "$WG_PSK"
+  elif [ -s "${KEY_DIR}/presharedkey" ]; then
+    cat "${KEY_DIR}/presharedkey"
+  fi
+}
+
+save_psk() {
+  local psk="$1"
+  [ -n "$psk" ] || return 0
+  ensure_dirs
+  printf '%s
+' "$psk" > "${KEY_DIR}/presharedkey"
+  chmod 600 "${KEY_DIR}/presharedkey"
+}
+
 have_cmd() { command -v "$1" >/dev/null 2>&1; }
 
 missing_deps() {
@@ -193,11 +219,17 @@ require_deps() {
 }
 
 cmd_check() {
-  if missing_deps; then
+  local tmp=""
+  tmp="$(mktemp)"
+  if ! missing_deps > "$tmp"; then
+    echo "Missing dependencies:"
+    cat "$tmp"
+    rm -f "$tmp"
     echo
     echo "Some dependencies are missing. Run: sudo bash $0 install-deps"
     exit 1
   fi
+  rm -f "$tmp"
   echo "All required dependencies are present."
 }
 
@@ -802,17 +834,23 @@ cmd_keygen() {
   need_root
   require_deps
   ensure_key
+  ensure_psk
   echo
   echo "WireGuard public key:"
   cat "${KEY_DIR}/publickey"
   echo
+  echo "WireGuard preshared key (secret; use the same value on both relay and entry nodes):"
+  cat "${KEY_DIR}/presharedkey"
+  echo
 }
 
 cmd_genpsk() {
+  need_root
   require_deps
+  ensure_psk
   echo
-  echo "WireGuard preshared key. Use the same value on both relay and entry nodes:"
-  wg genpsk
+  echo "WireGuard preshared key (secret; use the same value on both relay and entry nodes):"
+  cat "${KEY_DIR}/presharedkey"
   echo
 }
 
@@ -821,7 +859,8 @@ cmd_init_relay() {
   require_deps
   ensure_key
 
-  local entry_pub="" psk="${WG_PSK:-}" listen_port="$WG_PORT" wg_if="$WG_IF" relay_ip_cidr="$RELAY_WG_IP_CIDR" entry_ip="$ENTRY_WG_IP" wg_net="$WG_NET_V4"
+  local entry_pub="" psk="" listen_port="$WG_PORT" wg_if="$WG_IF" relay_ip_cidr="$RELAY_WG_IP_CIDR" entry_ip="$ENTRY_WG_IP" wg_net="$WG_NET_V4"
+  psk="$(default_psk)"
 
   while [ $# -gt 0 ]; do
     case "$1" in
@@ -863,6 +902,7 @@ cmd_init_relay() {
   validate_wg_pubkey "$entry_pub" "entry public key"
   [ -z "$psk" ] || validate_wg_psk "$psk" "WireGuard preshared key"
   validate_runtime_limits
+  save_psk "$psk"
 
   WG_IF="$wg_if"
   WG_PORT="$listen_port"
@@ -909,7 +949,8 @@ cmd_init_entry() {
   require_deps
   ensure_key
 
-  local relay_host="" relay_pub="" psk="${WG_PSK:-}" relay_port="$WG_PORT" wg_if="$WG_IF" entry_ip_cidr="$ENTRY_WG_IP_CIDR" allowed_ips="0.0.0.0/0"
+  local relay_host="" relay_pub="" psk="" relay_port="$WG_PORT" wg_if="$WG_IF" entry_ip_cidr="$ENTRY_WG_IP_CIDR" allowed_ips="0.0.0.0/0"
+  psk="$(default_psk)"
 
   while [ $# -gt 0 ]; do
     case "$1" in
@@ -955,6 +996,7 @@ cmd_init_entry() {
   [ -z "$psk" ] || validate_wg_psk "$psk" "WireGuard preshared key"
   validate_allowed_ips "$allowed_ips"
   validate_runtime_limits
+  save_psk "$psk"
 
   WG_IF="$wg_if"
   WG_PORT="$relay_port"
@@ -1203,8 +1245,8 @@ usage() {
 Usage:
   bash $0 check
   bash $0 install-deps
-  bash $0 keygen
-  bash $0 genpsk
+  bash $0 keygen        # generates local WireGuard key pair and PSK
+  bash $0 genpsk        # prints/saves the local PSK, creating it if missing
 
   bash $0 init-relay
   bash $0 init-entry
@@ -1222,7 +1264,7 @@ Usage:
 Non-interactive examples:
   bash $0 init-relay \\
     --entry-pub <ENTRY_PUBLIC_KEY> \\
-    --psk <OPTIONAL_PRESHARED_KEY> \\
+    --psk <PRESHARED_KEY_FROM_KEYGEN> \\
     --listen-port 51820 \\
     --wg-if wg-sdwan \\
     --relay-wg-ip-cidr 10.233.233.1/24 \\
@@ -1232,7 +1274,7 @@ Non-interactive examples:
   bash $0 init-entry \\
     --relay-host sdwan.example.com \\
     --relay-pub <RELAY_PUBLIC_KEY> \\
-    --psk <OPTIONAL_PRESHARED_KEY> \\
+    --psk <PRESHARED_KEY_FROM_KEYGEN> \\
     --relay-port 51820 \\
     --wg-if wg-sdwan \\
     --entry-wg-ip-cidr 10.233.233.2/24 \\
@@ -1246,6 +1288,11 @@ Optional relay limits on entry node:
   --connect-timeout 15
   --log-level info
   --target-family ipv4
+
+PSK behavior:
+  keygen creates ${KEY_DIR}/presharedkey and prints it.
+  init-relay/init-entry use that saved PSK by default when present.
+  Use --psk <value> to provide/save a PSK manually, or --no-psk to omit it.
 
 Target protocol selection:
   bash $0 add-target --proto tcp target1 203.0.113.10 54677 54677
