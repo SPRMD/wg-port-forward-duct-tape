@@ -20,7 +20,6 @@ TARGET_FAMILY="${TARGET_FAMILY:-ipv4}"
 
 CONF_DIR="/etc/wg-sdwan-port-relay"
 KEY_DIR="${CONF_DIR}/keys"
-PSK_FILE="${KEY_DIR}/presharedkey"
 FORWARDS="${CONF_DIR}/forwards.csv"
 WG_CONF="/etc/wireguard/${WG_IF}.conf"
 RELAY_BIN="/usr/local/bin/wg-sdwan-port-relay.py"
@@ -167,15 +166,6 @@ ensure_key() {
   fi
 }
 
-ensure_psk() {
-  ensure_dirs
-  if [ ! -f "$PSK_FILE" ]; then
-    backup_path "$PSK_FILE"
-    wg genpsk > "$PSK_FILE"
-    chmod 600 "$PSK_FILE"
-  fi
-}
-
 have_cmd() { command -v "$1" >/dev/null 2>&1; }
 
 missing_deps() {
@@ -205,12 +195,10 @@ require_deps() {
 cmd_check() {
   if missing_deps; then
     echo
-    echo "Some dependencies are missing."
-    next_commands check-missing
+    echo "Some dependencies are missing. Run: sudo bash $0 install-deps"
     exit 1
   fi
   echo "All required dependencies are present."
-  next_commands check-ok
 }
 
 cmd_install_deps() {
@@ -234,9 +222,6 @@ cmd_install_deps() {
     echo "Unsupported package manager. Please install: wireguard-tools, iproute2/iproute, iptables, python3, coreutils, awk" >&2
     exit 1
   fi
-
-  echo "Dependencies installation command completed."
-  next_commands install-deps
 }
 
 validate_port() {
@@ -343,6 +328,32 @@ if len(raw) != 32:
 PY
 }
 
+validate_wg_psk() {
+  local key="$1" label="${2:-WireGuard preshared key}"
+  python3 - "$key" "$label" <<'PY'
+import base64, sys
+key, label = sys.argv[1], sys.argv[2]
+try:
+    raw = base64.b64decode(key, validate=True)
+except Exception:
+    raise SystemExit(f"invalid {label}: not valid base64")
+if len(raw) != 32:
+    raise SystemExit(f"invalid {label}: decoded length must be 32 bytes")
+PY
+}
+
+validate_proto() {
+  local proto="$1"
+  case "$proto" in tcp|udp|both) :;; *) echo "Invalid protocol: ${proto}. Use tcp, udp, or both." >&2; exit 1;; esac
+}
+
+psk_line() {
+  local psk="${1:-}"
+  if [ -n "$psk" ]; then
+    printf 'PresharedKey = %s\n' "$psk"
+  fi
+}
+
 validate_allowed_ips() {
   local value="$1"
   python3 - "$value" <<'PY'
@@ -370,45 +381,21 @@ validate_runtime_limits() {
 }
 
 ask() {
-  local var="$1" prompt="$2" default_value="${3:-}" input=""
-  read -rp "${prompt}${default_value:+ [$default_value]}: " input
-  printf -v "$var" '%s' "${input:-$default_value}"
+  local __ask_var="$1" __ask_prompt="$2" __ask_default="${3:-}" __ask_reply=""
+  read -rp "${__ask_prompt}${__ask_default:+ [$__ask_default]}: " __ask_reply
+  printf -v "$__ask_var" '%s' "${__ask_reply:-$__ask_default}"
 }
 
 ask_required() {
-  local var="$1" prompt="$2" input=""
+  local __ask_var="$1" __ask_prompt="$2" __ask_reply=""
   while true; do
-    read -rp "${prompt}: " input
-    if [ -n "$input" ]; then
-      printf -v "$var" '%s' "$input"
+    read -rp "${__ask_prompt}: " __ask_reply
+    if [ -n "$__ask_reply" ]; then
+      printf -v "$__ask_var" '%s' "$__ask_reply"
       return 0
     fi
     echo "Value cannot be empty."
   done
-}
-
-ask_psk() {
-  local var="$1" prompt="$2" existing="" input=""
-  existing="$(psk_from_file)"
-
-  if [ -n "$existing" ]; then
-    echo "A saved WireGuard preshared key already exists at: $PSK_FILE"
-    read -rp "${prompt} [press Enter to use saved key, type '-' to skip]: " input
-    if [ -z "$input" ]; then
-      printf -v "$var" '%s' "$existing"
-    elif [ "$input" = "-" ]; then
-      printf -v "$var" '%s' ""
-    else
-      validate_wg_pubkey "$input" "WireGuard preshared key"
-      printf -v "$var" '%s' "$input"
-    fi
-  else
-    read -rp "${prompt} [press Enter to skip]: " input
-    if [ -n "$input" ]; then
-      validate_wg_pubkey "$input" "WireGuard preshared key"
-    fi
-    printf -v "$var" '%s' "$input"
-  fi
 }
 
 ask_port() {
@@ -432,65 +419,6 @@ endpoint() {
   else
     echo "${host}:${port}"
   fi
-}
-
-next_commands() {
-  local topic="${1:-}"
-  echo
-  echo "Next command(s):"
-  case "$topic" in
-    check-ok)
-      echo "  sudo bash $0 keygen"
-      echo "  sudo bash $0 init-relay    # on the relay node"
-      echo "  sudo bash $0 init-entry    # on the entry node"
-      ;;
-    check-missing)
-      echo "  sudo bash $0 install-deps"
-      echo "  sudo bash $0 check"
-      ;;
-    install-deps)
-      echo "  sudo bash $0 check"
-      echo "  sudo bash $0 keygen"
-      ;;
-    keygen)
-      echo "  # Run keygen on both nodes. Use the same PSK on both sides."
-      echo "  # Then initialize the relay node:"
-      echo "  sudo bash $0 init-relay"
-      echo "  # Then initialize the entry node:"
-      echo "  sudo bash $0 init-entry"
-      ;;
-    pskgen)
-      echo "  # Use the same PSK on both nodes when prompted, or pass it explicitly:"
-      echo "  sudo bash $0 init-relay --psk '<WIREGUARD_PRESHARED_KEY>'"
-      echo "  sudo bash $0 init-entry --psk '<WIREGUARD_PRESHARED_KEY>'"
-      ;;
-    init-relay)
-      echo "  # On the entry node:"
-      echo "  sudo bash $0 init-entry"
-      ;;
-    init-entry)
-      echo "  # On the entry node, add a target service:"
-      echo "  sudo bash $0 add-target target1 203.0.113.10 54677 54677 --protocol udp"
-      echo "  sudo bash $0 status"
-      ;;
-    add-target)
-      echo "  sudo bash $0 status"
-      echo "  sudo bash $0 list-targets"
-      ;;
-    del-target|list-targets|status)
-      echo "  sudo bash $0 add-target target1 203.0.113.10 54677 54677 --protocol udp"
-      echo "  sudo bash $0 status"
-      ;;
-    rollback)
-      echo "  sudo bash $0 check"
-      echo "  sudo bash $0 keygen"
-      ;;
-    *)
-      echo "  sudo bash $0 check"
-      echo "  sudo bash $0 keygen"
-      ;;
-  esac
-  echo
 }
 
 install_relay() {
@@ -571,20 +499,31 @@ def load_forwards():
         for row in csv.reader(f):
             if not row or row[0].strip().startswith("#"):
                 continue
-            if len(row) not in (4, 5):
+            row = [x.strip() for x in row]
+            # Backward compatible formats:
+            #   old: name,target_host,target_port,listen_port  (defaults to both)
+            #   new: name,proto,target_host,target_port,listen_port
+            if len(row) == 4:
+                name, target_host, target_port, listen_port = row
+                proto = "both"
+            elif len(row) == 5:
+                name, proto, target_host, target_port, listen_port = row
+                proto = proto.lower()
+            else:
                 log("warning", f"skip invalid row: {row}")
                 continue
-            if len(row) == 4:
-                name, target_host, target_port, listen_port = [x.strip() for x in row]
-                protocol = "both"
-            else:
-                name, target_host, target_port, listen_port, protocol = [x.strip() for x in row]
-                protocol = protocol.lower()
-            if protocol not in {"tcp", "udp", "both"}:
-                log("warning", f"skip invalid protocol in row: {row}")
+            if proto not in {"tcp", "udp", "both"}:
+                log("warning", f"skip invalid protocol {proto!r} in row: {row}")
                 continue
-            rows.append((name, target_host, int(target_port), int(listen_port), protocol))
+            try:
+                rows.append((name, proto, target_host, int(target_port), int(listen_port)))
+            except ValueError:
+                log("warning", f"skip row with non-integer port: {row}")
     return rows
+
+
+def enabled_protocols(proto):
+    return ("tcp", "udp") if proto == "both" else (proto,)
 
 
 def recv_with_timeout(sock, size, timeout):
@@ -798,21 +737,17 @@ def main():
         while not stop_event.is_set():
             time.sleep(60)
         return
-    used_tcp_ports = set()
-    used_udp_ports = set()
-    for _, target_host, target_port, listen_port, protocol in rows:
-        if protocol in {"tcp", "both"}:
-            if listen_port in used_tcp_ports:
-                raise SystemExit(f"duplicate TCP listen port: {listen_port}")
-            used_tcp_ports.add(listen_port)
-        if protocol in {"udp", "both"}:
-            if listen_port in used_udp_ports:
-                raise SystemExit(f"duplicate UDP listen port: {listen_port}")
-            used_udp_ports.add(listen_port)
-    for _, target_host, target_port, listen_port, protocol in rows:
-        if protocol in {"tcp", "both"}:
+    used_ports = set()
+    for _, proto, target_host, target_port, listen_port in rows:
+        for enabled_proto in enabled_protocols(proto):
+            key = (enabled_proto, listen_port)
+            if key in used_ports:
+                raise SystemExit(f"duplicate {enabled_proto.upper()} listen port: {listen_port}")
+            used_ports.add(key)
+    for _, proto, target_host, target_port, listen_port in rows:
+        if proto in {"tcp", "both"}:
             threading.Thread(target=tcp_listener, args=(target_host, target_port, listen_port), daemon=True).start()
-        if protocol in {"udp", "both"}:
+        if proto in {"udp", "both"}:
             threading.Thread(target=UDPRelay(target_host, target_port, listen_port).start, daemon=True).start()
     threading.Thread(target=metrics_loop, daemon=True).start()
     while not stop_event.is_set():
@@ -863,184 +798,22 @@ EOF
   systemctl daemon-reload
 }
 
-
-psk_from_file() {
-  if [ -f "$PSK_FILE" ]; then
-    sed -n '1p' "$PSK_FILE"
-  fi
-}
-
-save_psk() {
-  local psk="$1"
-  [ -n "$psk" ] || return 0
-  validate_wg_pubkey "$psk" "WireGuard preshared key"
-  ensure_dirs
-  backup_path "$PSK_FILE"
-  printf '%s\n' "$psk" > "$PSK_FILE"
-  chmod 600 "$PSK_FILE"
-}
-
-psk_line_for_conf() {
-  local psk="$1"
-  if [ -z "$psk" ]; then
-    psk="$(psk_from_file)"
-  fi
-  if [ -n "$psk" ]; then
-    validate_wg_pubkey "$psk" "WireGuard preshared key"
-    printf 'PresharedKey = %s' "$psk"
-  fi
-}
-
-cmd_pskgen() {
-  need_root
-  require_deps
-  ensure_dirs
-
-  local force=0 no_save=0
-  while [ $# -gt 0 ]; do
-    case "$1" in
-      --force) force=1; shift;;
-      --no-save) no_save=1; shift;;
-      *) echo "Unknown argument: $1" >&2; exit 1;;
-    esac
-  done
-
-  echo
-  echo "WireGuard preshared key:"
-
-  if [ "$no_save" -eq 1 ]; then
-    wg genpsk
-    next_commands pskgen
-    return 0
-  fi
-
-  if [ -f "$PSK_FILE" ] && [ "$force" -ne 1 ]; then
-    cat "$PSK_FILE"
-    echo
-    echo "Existing PSK found at: $PSK_FILE"
-    echo "Use --force to overwrite it, or --no-save to print a new key without saving."
-    next_commands pskgen
-    return 0
-  fi
-
-  backup_path "$PSK_FILE"
-  wg genpsk | tee "$PSK_FILE"
-  chmod 600 "$PSK_FILE"
-  next_commands pskgen
-}
-
 cmd_keygen() {
   need_root
   require_deps
-
-  local force_psk=0 psk_arg="" no_psk=0 input=""
-
-  while [ $# -gt 0 ]; do
-    case "$1" in
-      --force-psk)
-        force_psk=1
-        shift
-        ;;
-      --psk|--preshared-key)
-        psk_arg="$2"
-        shift 2
-        ;;
-      --no-psk)
-        no_psk=1
-        shift
-        ;;
-      *)
-        echo "Unknown argument: $1" >&2
-        exit 1
-        ;;
-    esac
-  done
-
   ensure_key
-
-  if [ "$no_psk" -eq 1 ]; then
-    echo "Skipping PSK generation because --no-psk was provided."
-  elif [ -n "$psk_arg" ]; then
-    save_psk "$psk_arg"
-  elif [ "$force_psk" -eq 1 ]; then
-    backup_path "$PSK_FILE"
-    wg genpsk > "$PSK_FILE"
-    chmod 600 "$PSK_FILE"
-  elif [ -t 0 ]; then
-    if [ -f "$PSK_FILE" ]; then
-      echo
-      echo "Existing WireGuard preshared key found at: $PSK_FILE"
-      echo "Choose PSK action:"
-      echo "  Enter : keep and print the existing PSK"
-      echo "  g     : generate a new PSK"
-      echo "  p     : paste an existing PSK and save it"
-      read -rp "PSK action [Enter/g/p]: " input
-
-      case "$input" in
-        "")
-          :
-          ;;
-        g|G)
-          backup_path "$PSK_FILE"
-          wg genpsk > "$PSK_FILE"
-          chmod 600 "$PSK_FILE"
-          ;;
-        p|P)
-          ask_required psk_arg "Paste WireGuard preshared key"
-          save_psk "$psk_arg"
-          ;;
-        *)
-          echo "Invalid PSK action: $input" >&2
-          exit 1
-          ;;
-      esac
-    else
-      echo
-      echo "No WireGuard preshared key found."
-      echo "Choose PSK action:"
-      echo "  Enter : generate and save a new PSK"
-      echo "  p     : paste an existing PSK and save it"
-      echo "  -     : skip PSK generation"
-      read -rp "PSK action [Enter/p/-]: " input
-
-      case "$input" in
-        "")
-          ensure_psk
-          ;;
-        p|P)
-          ask_required psk_arg "Paste WireGuard preshared key"
-          save_psk "$psk_arg"
-          ;;
-        -)
-          :
-          ;;
-        *)
-          echo "Invalid PSK action: $input" >&2
-          exit 1
-          ;;
-      esac
-    fi
-  else
-    ensure_psk
-  fi
-
   echo
   echo "WireGuard public key:"
   cat "${KEY_DIR}/publickey"
   echo
+}
 
-  if [ -f "$PSK_FILE" ]; then
-    echo "WireGuard preshared key:"
-    cat "$PSK_FILE"
-    echo
-    echo "Use the same preshared key on both nodes. Keep it private."
-    echo "To rotate only the PSK: sudo bash $0 keygen --force-psk"
-  else
-    echo "WireGuard preshared key: not generated"
-    echo "Generate one later with: sudo bash $0 keygen --force-psk"
-  fi
-
-  next_commands keygen
+cmd_genpsk() {
+  require_deps
+  echo
+  echo "WireGuard preshared key. Use the same value on both relay and entry nodes:"
+  wg genpsk
+  echo
 }
 
 cmd_init_relay() {
@@ -1048,12 +821,13 @@ cmd_init_relay() {
   require_deps
   ensure_key
 
-  local entry_pub="" listen_port="$WG_PORT" wg_if="$WG_IF" relay_ip_cidr="$RELAY_WG_IP_CIDR" entry_ip="$ENTRY_WG_IP" wg_net="$WG_NET_V4" psk=""
+  local entry_pub="" psk="${WG_PSK:-}" listen_port="$WG_PORT" wg_if="$WG_IF" relay_ip_cidr="$RELAY_WG_IP_CIDR" entry_ip="$ENTRY_WG_IP" wg_net="$WG_NET_V4"
 
   while [ $# -gt 0 ]; do
     case "$1" in
       --entry-pub) entry_pub="$2"; shift 2;;
-      --psk|--preshared-key) psk="$2"; shift 2;;
+      --psk) psk="$2"; shift 2;;
+      --no-psk) psk=""; shift;;
       --listen-port) listen_port="$2"; shift 2;;
       --wg-if) wg_if="$2"; shift 2;;
       --relay-wg-ip-cidr) relay_ip_cidr="$2"; shift 2;;
@@ -1075,7 +849,7 @@ cmd_init_relay() {
     ask entry_ip "Entry node WireGuard IP without CIDR" "$entry_ip"
     ask wg_net "WireGuard IPv4 subnet for NAT" "$wg_net"
     [ -n "$entry_pub" ] || ask_required entry_pub "Entry node WireGuard public key"
-    [ -n "$psk" ] || ask_psk psk "WireGuard preshared key, same key as the entry node"
+    ask psk "WireGuard preshared key, optional" "$psk"
   elif [ -z "$entry_pub" ]; then
     echo "Missing --entry-pub" >&2
     exit 1
@@ -1087,9 +861,7 @@ cmd_init_relay() {
   validate_ip "$entry_ip" "entry WireGuard IP"
   validate_ipv4_cidr "$wg_net" "WireGuard IPv4 subnet"
   validate_wg_pubkey "$entry_pub" "entry public key"
-  if [ -n "$psk" ]; then save_psk "$psk"; fi
-  local psk_line=""
-  psk_line="$(psk_line_for_conf "$psk")"
+  [ -z "$psk" ] || validate_wg_psk "$psk" "WireGuard preshared key"
   validate_runtime_limits
 
   WG_IF="$wg_if"
@@ -1114,8 +886,10 @@ PostDown = iptables -t nat -D POSTROUTING -s ${WG_NET_V4} -m comment --comment $
 
 [Peer]
 PublicKey = ${entry_pub}
-${psk_line:+${psk_line}
-}AllowedIPs = ${ENTRY_WG_IP}/32
+EOF
+  psk_line "$psk" >> "$WG_CONF"
+  cat >> "$WG_CONF" <<EOF
+AllowedIPs = ${ENTRY_WG_IP}/32
 PersistentKeepalive = 25
 EOF
 
@@ -1128,10 +902,6 @@ EOF
   echo "Relay public key:"
   cat "${KEY_DIR}/publickey"
   echo
-  if [ -n "$(psk_from_file)" ]; then
-    echo "Saved WireGuard preshared key path: $PSK_FILE"
-  fi
-  next_commands init-relay
 }
 
 cmd_init_entry() {
@@ -1139,13 +909,14 @@ cmd_init_entry() {
   require_deps
   ensure_key
 
-  local relay_host="" relay_pub="" relay_port="$WG_PORT" wg_if="$WG_IF" entry_ip_cidr="$ENTRY_WG_IP_CIDR" allowed_ips="0.0.0.0/0" psk=""
+  local relay_host="" relay_pub="" psk="${WG_PSK:-}" relay_port="$WG_PORT" wg_if="$WG_IF" entry_ip_cidr="$ENTRY_WG_IP_CIDR" allowed_ips="0.0.0.0/0"
 
   while [ $# -gt 0 ]; do
     case "$1" in
       --relay-host) relay_host="$2"; shift 2;;
       --relay-pub) relay_pub="$2"; shift 2;;
-      --psk|--preshared-key) psk="$2"; shift 2;;
+      --psk) psk="$2"; shift 2;;
+      --no-psk) psk=""; shift;;
       --relay-port) relay_port="$2"; shift 2;;
       --wg-if) wg_if="$2"; shift 2;;
       --entry-wg-ip-cidr) entry_ip_cidr="$2"; shift 2;;
@@ -1169,7 +940,7 @@ cmd_init_entry() {
     [ -n "$relay_host" ] || ask_required relay_host "Relay node address or DDNS hostname"
     ask_port relay_port "Relay WireGuard UDP port" "$relay_port"
     [ -n "$relay_pub" ] || ask_required relay_pub "Relay node WireGuard public key"
-    [ -n "$psk" ] || ask_psk psk "WireGuard preshared key, same key as the relay node"
+    ask psk "WireGuard preshared key, optional" "$psk"
     ask allowed_ips "AllowedIPs, default is usually recommended" "$allowed_ips"
   elif [ -z "$relay_host" ] || [ -z "$relay_pub" ]; then
     echo "Missing --relay-host or --relay-pub" >&2
@@ -1181,9 +952,7 @@ cmd_init_entry() {
   validate_port "$relay_port" "relay port"
   validate_cidr "$entry_ip_cidr" "entry WireGuard address CIDR"
   validate_wg_pubkey "$relay_pub" "relay public key"
-  if [ -n "$psk" ]; then save_psk "$psk"; fi
-  local psk_line=""
-  psk_line="$(psk_line_for_conf "$psk")"
+  [ -z "$psk" ] || validate_wg_psk "$psk" "WireGuard preshared key"
   validate_allowed_ips "$allowed_ips"
   validate_runtime_limits
 
@@ -1206,8 +975,10 @@ Table = off
 
 [Peer]
 PublicKey = ${relay_pub}
-${psk_line:+${psk_line}
-}Endpoint = $(endpoint "$relay_host" "$relay_port")
+EOF
+  psk_line "$psk" >> "$WG_CONF"
+  cat >> "$WG_CONF" <<EOF
+Endpoint = $(endpoint "$relay_host" "$relay_port")
 AllowedIPs = ${allowed_ips}
 PersistentKeepalive = 25
 EOF
@@ -1221,10 +992,6 @@ EOF
   echo "Entry public key:"
   cat "${KEY_DIR}/publickey"
   echo
-  if [ -n "$(psk_from_file)" ]; then
-    echo "Saved WireGuard preshared key path: $PSK_FILE"
-  fi
-  next_commands init-entry
 }
 
 cmd_add_target() {
@@ -1235,27 +1002,40 @@ cmd_add_target() {
   validate_runtime_limits
   install_relay
 
-  [ $# -ge 4 ] || {
-    echo "Usage: bash $0 add-target <name> <target-host-or-ipv4> <target-port> <entry-listen-port> [--protocol tcp|udp|both]" >&2
-    echo "Example: bash $0 add-target target1 203.0.113.10 54677 54677" >&2
-    echo "Example: bash $0 add-target target2 exit.example.com 54677 54678 --protocol udp" >&2
-    exit 1
-  }
+  local proto="both" name="" target_host="" target_port="" listen_port="" tmp=""
 
-  local name="$1" target_host="$2" target_port="$3" listen_port="$4" protocol="both" tmp=""
-  shift 4
   while [ $# -gt 0 ]; do
     case "$1" in
-      --protocol) protocol="$2"; shift 2;;
-      *) echo "Unknown argument: $1" >&2; exit 1;;
+      --proto) proto="$2"; shift 2;;
+      *) break;;
     esac
   done
 
+  if [ $# -eq 5 ]; then
+    name="$1"
+    proto="$2"
+    target_host="$3"
+    target_port="$4"
+    listen_port="$5"
+  elif [ $# -eq 4 ]; then
+    name="$1"
+    target_host="$2"
+    target_port="$3"
+    listen_port="$4"
+  else
+    echo "Usage: bash $0 add-target [--proto tcp|udp|both] <name> <target-host-or-ipv4> <target-port> <entry-listen-port>" >&2
+    echo "   or: bash $0 add-target <name> <tcp|udp|both> <target-host-or-ipv4> <target-port> <entry-listen-port>" >&2
+    echo "Example: bash $0 add-target --proto tcp target1 203.0.113.10 54677 54677" >&2
+    echo "Example: bash $0 add-target target2 udp exit.example.com 54677 54678" >&2
+    echo "Example: bash $0 add-target target3 203.0.113.10 54677 54679  # both TCP and UDP" >&2
+    exit 1
+  fi
+
   validate_target_name "$name"
+  validate_proto "$proto"
   validate_host "$target_host"
   validate_port "$target_port" "target port"
   validate_port "$listen_port" "listen port"
-  case "$protocol" in tcp|udp|both) :;; *) echo "Invalid protocol: ${protocol}. Use tcp, udp, or both." >&2; exit 1;; esac
 
   python3 - "$target_host" "$target_port" <<'PY'
 import socket, sys
@@ -1274,7 +1054,7 @@ PY
   tmp="$(mktemp)"
   awk -F, -v name="$name" '$1 != name { print }' "$FORWARDS" > "$tmp"
   mv "$tmp" "$FORWARDS"
-  echo "${name},${target_host},${target_port},${listen_port},${protocol}" >> "$FORWARDS"
+  echo "${name},${proto},${target_host},${target_port},${listen_port}" >> "$FORWARDS"
 
   systemctl enable --now wg-sdwan-port-relay.service
   systemctl restart wg-sdwan-port-relay.service
@@ -1282,19 +1062,10 @@ PY
   echo
   echo "Added target:"
   echo "  name: ${name}"
+  echo "  protocol: ${proto}"
   echo "  listen: [::]:${listen_port}"
   echo "  target: ${target_host}:${target_port}"
-  echo "  protocol: ${protocol}"
   echo
-  next_commands add-target
-}
-
-cmd_add_udp_target() {
-  cmd_add_target "$@" --protocol udp
-}
-
-cmd_add_tcp_target() {
-  cmd_add_target "$@" --protocol tcp
 }
 
 cmd_del_target() {
@@ -1310,7 +1081,6 @@ cmd_del_target() {
   mv "$tmp" "$FORWARDS"
   systemctl restart wg-sdwan-port-relay.service >/dev/null 2>&1 || true
   echo "Deleted target: $1"
-  next_commands del-target
 }
 
 cmd_list() {
@@ -1323,7 +1093,6 @@ cmd_list() {
     echo "None"
   fi
   echo
-  next_commands list-targets
 }
 
 cmd_status() {
@@ -1342,7 +1111,6 @@ cmd_status() {
     echo "None: ${FORWARDS}"
   fi
   echo
-  next_commands status
 }
 
 cmd_rollback() {
@@ -1428,7 +1196,6 @@ cmd_rollback() {
 
   rm -rf "$STATE_DIR" "$BACKUP_DIR"
   echo "Rollback completed."
-  next_commands rollback
 }
 
 usage() {
@@ -1436,17 +1203,15 @@ usage() {
 Usage:
   bash $0 check
   bash $0 install-deps
-  bash $0 keygen                         # Generate/show WireGuard key pair and PSK
-  bash $0 keygen --force-psk             # Rotate only the saved PSK
-  bash $0 keygen --psk <PRESHARED_KEY>   # Save an existing PSK
-  bash $0 pskgen                         # Compatibility: generate/show PSK only
+  bash $0 keygen
+  bash $0 genpsk
 
   bash $0 init-relay
   bash $0 init-entry
 
   bash $0 add-target target1 203.0.113.10 54677 54677
-  bash $0 add-target target2 exit.example.com 54677 54678 --protocol udp
-  bash $0 add-udp-target target3 exit.example.com 54677 54679
+  bash $0 add-target --proto tcp target2 exit.example.com 54677 54678
+  bash $0 add-target target3 udp exit.example.com 54677 54679
   bash $0 del-target target1
   bash $0 list-targets
   bash $0 status
@@ -1457,6 +1222,7 @@ Usage:
 Non-interactive examples:
   bash $0 init-relay \\
     --entry-pub <ENTRY_PUBLIC_KEY> \\
+    --psk <OPTIONAL_PRESHARED_KEY> \\
     --listen-port 51820 \\
     --wg-if wg-sdwan \\
     --relay-wg-ip-cidr 10.233.233.1/24 \\
@@ -1466,6 +1232,7 @@ Non-interactive examples:
   bash $0 init-entry \\
     --relay-host sdwan.example.com \\
     --relay-pub <RELAY_PUBLIC_KEY> \\
+    --psk <OPTIONAL_PRESHARED_KEY> \\
     --relay-port 51820 \\
     --wg-if wg-sdwan \\
     --entry-wg-ip-cidr 10.233.233.2/24 \\
@@ -1479,6 +1246,11 @@ Optional relay limits on entry node:
   --connect-timeout 15
   --log-level info
   --target-family ipv4
+
+Target protocol selection:
+  bash $0 add-target --proto tcp target1 203.0.113.10 54677 54677
+  bash $0 add-target --proto udp target2 203.0.113.10 54677 54678
+  bash $0 add-target --proto both target3 203.0.113.10 54677 54679
 
 Compatibility aliases:
   init-sdwan      -> init-relay
@@ -1496,15 +1268,13 @@ case "$cmd" in
   check) cmd_check "$@";;
   install-deps) cmd_install_deps "$@";;
   keygen) cmd_keygen "$@";;
-  pskgen) cmd_pskgen "$@";;
+  genpsk|pskgen) cmd_genpsk "$@";;
   init-relay|init-sdwan) cmd_init_relay "$@";;
   init-entry|init-a) cmd_init_entry "$@";;
   add-target|add-exit) cmd_add_target "$@";;
-  add-udp-target) cmd_add_udp_target "$@";;
-  add-tcp-target) cmd_add_tcp_target "$@";;
   del-target|del-exit) cmd_del_target "$@";;
   list-targets|list-exits) cmd_list "$@";;
   status) cmd_status "$@";;
   rollback) cmd_rollback "$@";;
-  *) usage; next_commands;;
+  *) usage;;
 esac
