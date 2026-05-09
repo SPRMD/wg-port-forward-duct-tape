@@ -106,14 +106,7 @@
 将脚本复制到入口节点和中转节点：
 
 ```bash
-sudo install -m 700 wg-sdwan-port-relay.sh /root/wg-sdwan-port-relay.sh
-```
-
-或者：
-
-```bash
-chmod +x wg-sdwan-port-relay.sh
-sudo mv wg-sdwan-port-relay.sh /root/wg-sdwan-port-relay.sh
+wget -O wg-sdwan-port-relay.sh https://raw.githubusercontent.com/SPRMD/wg-port-forward-duct-tape/main/wg-sdwan-port-relay.sh && chmod +x wg-sdwan-port-relay.sh
 ```
 
 ## 快速开始
