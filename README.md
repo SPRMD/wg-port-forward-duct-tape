@@ -1,4 +1,4 @@
-# wg-sdwan-port-relay
+# wg-port-forward-duct-tape
 
 A small Bash + Python helper for building a WireGuard-based TCP/UDP port relay.
 
