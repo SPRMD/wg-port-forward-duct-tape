@@ -4,6 +4,10 @@ A small Bash + Python helper for building a WireGuard-based TCP/UDP port relay.
 
 It is designed for a topology where an IPv6-reachable entry node exposes public ports, forwards traffic through a WireGuard tunnel to a relay node, and the relay node provides IPv4 egress to reach one or more target services.
 
+This project is intended for personal servers and small-scale deployments.
+
+It is not designed as a production-grade proxy or SDWAN system.
+
 ## Features
 
 - WireGuard tunnel setup between an entry node and a relay node
